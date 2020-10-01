@@ -213,4 +213,107 @@ orca_remove_entry(orca_trans *trans, struct dentry *de, struct inode *ino)
         res_entry->ino = 0;
         orca_memlock_block(sb, block_base);
     }
+
+    /* dir->i_version++; */
+    dir->i_ctime = dir->i_mtime = CURRENT_TIME_SEC;
+
+    oi_dir = orca_get_inode(sb, dir->i_ino);
+    orca_add_logentry(sb, trans, oi_dir, MAX_DATA_PER_LENTRY, LE_DATA);
+
+    orca_memunlock_inode(sb, oi_dir);
+    oi_dir->i_mtime = cpu_to_le32(dir->i_mtime.tv_sec);
+    oi_dir->i_ctime = cpu_to_le32(dir->i_ctime.tv_sec);
+    orca_memunlock_inode(sb, oi_dir);
+
+    ret = 0;
+
+out:
+    return ret;
 }
+
+static int
+orca_readdir(struct file *file, struct dir_context *ctx)
+{
+    struct inode *inode = file_inode(file);
+    struct super_block *sb = inode->i_sb;
+    struct orca_inode *oi;
+    char *block_base;
+    unsigned long offset;
+    struct orca_direntry *de;
+    ino_t ino;
+
+    offset = ctx->pos & (sb->s_blocksize - 1);
+
+    while (ctx->pos < inode->i_size) {
+        unsigned long block = ctx->pos >> sb->s_blocksize_bits;
+        block_base = orca_get_block(sb, orca_find_data_block(inode, block));
+
+        if (!block_base) {
+            orca_dbg("Directory %lu contains a hole at offset %lld\n",
+                inode->i_ino, ctx->pos);
+            ctx->pos += sb->s_blocksize - offset;
+            continue;
+        }
+
+#if 0
+        if (file->f_version != inode->i_version) {
+            for (i = 0; i < sb->s_blocksize && i < offsetl; ) {
+                de = (struct orca_direntry *)(block_base + i);
+
+                /**
+                 * It's too expensive to do a full dirent test each time
+                 * round this loop, but we do have to test at least that
+                 * it is non-zero. A failure will be detected in the
+                 * dirent test below.
+                **/
+                if (le16_to_cpu(de->de_len) < ORCA_DIR_REC_LEN(1))
+                    break;
+
+                i += le16_to_cpu(de->de_len);
+            }
+
+            offset = i;
+            ctx->pos = (ctx->pos & ~(sb->s_blocksize - 1)) | offset;
+            file->f_version = inode->i_version;
+        }
+#endif
+
+        while (ctx->pos < inode->i_size && offset < sb->s_blocksize) {
+            de = (struct orca_direntry *)(block_base + 1);
+
+            if (!orca_check_dir_entry("orca_readdir", inode, de, block_base,
+                offset)) {
+                    /* On error, skip to the next block */
+                    ctx->pos = ALIGN(ctx->pos, sb->s_blocksize);
+                    break;
+            }
+
+            offset += le16_to_cpu(de->de_len);
+
+            if (de->ino) {
+                ino = le64_to_cpu(de->ino);
+                oi = orca_get_inode(sb, ino);
+
+                if (!dir_emit(ctx, de->name, de->name_len, ino,
+                    IF2DT(le16_to_cpu(oi->i_mode))))
+                        return 0;
+            }
+
+            ctx->pos += le16_to_cpu(de->de_len);
+        }
+
+        offset = 0;
+    }
+
+    return 0;
+}
+
+const struct file_operations orca_dir_ops = {
+    .read = generic_read_dir,
+    .iterate = orca_readdir,
+    .fsync = noop_fsync,
+    .unlocked_ioctl = orca_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = orca_compat_ioctl,
+#endif
+};
