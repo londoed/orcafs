@@ -15,8 +15,8 @@ struct backing_dev_info orca_backing_dev_info __read_mostly = {
     .capabilities = BDI_CAP_NO_ACCT_AND_WRITEBACK,
 };
 
-unsigned int blk_type_to_shift[PMFS_BLOCK_TYPE_MAX] = {12, 21, 30};
-uint32_t blk_type_to_size[PMFS_BLOCK_TYPE_MAX] = {0x1000, 0x200000, 0x40000000};
+unsigned int btype_to_shift[PMFS_BLOCK_TYPE_MAX] = {12, 21, 30};
+uint32_t btype_to_size[PMFS_BLOCK_TYPE_MAX] = {0x1000, 0x200000, 0x40000000};
 
 /**
  * Allocate a data block for inode and return it's absolute block number.
@@ -26,7 +26,7 @@ static int
 orca_new_data_block(struct super_block *sb, struct orca_inode *oi,
     unsigned long *block_num, int zero)
 {
-    unsigned int data_bits = blk_type_to_shift[oi->i_blk_type];
+    unsigned int data_bits = btype_to_shift[oi->i_blk_type];
     int err = orca_new_block(sb, block_num, oi->i_blk_type, zero);
 
     if (!err) {
@@ -137,7 +137,7 @@ orca_find_region(struct inode *ino, loff_t *offset, int hole)
 {
     struct super_block *sb = ino->i_sb;
     struct orca_inode *io = orca_get_inode(sb, ino->i_ino);
-    unsigned int data_bits = blk_type_to_shift[oi->i_blk_type];
+    unsigned int data_bits = btype_to_shift[oi->i_blk_type];
     unsigned long first_block_num, last_block_num;
     unsigned long blocks = 0, offset_in_block;
     int data_found = 0, hole_found = 0;
