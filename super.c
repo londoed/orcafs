@@ -120,7 +120,8 @@ fail:
     return (void __force *)ret;
 }
 
-static inline int orca_iounmap(void *virt_addr, ssize_t size, int protected)
+static inline int
+orca_iounmap(void *virt_addr, ssize_t size, int protected)
 {
     iounmap((void __iomem __force *)virt_addr);
     return 0;
