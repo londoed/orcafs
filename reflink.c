@@ -1,0 +1,288 @@
+#include <linux/sched/signal.h>
+
+#include "orcafs.h"
+#include "bkey_on_stack.h"
+#include "btree_update.h"
+#include "extents.h"
+#include "inode.h"
+#include "io.h"
+#include "reflink.h"
+
+const char *
+orca_reflink_p_invalid(const struct orca_fs *c, struct bkey_s_c k)
+{
+    struct bkey_s_c_reflink_p p = bkey_s_c_to_reflink_p(k);
+
+    if (bkey_val_bytes(p.k) != sizeof(*p.v))
+        return "incorrect value size";
+
+    return NULL;
+}
+
+void
+orca_reflink_p_to_text(struct printbuf *out, struct orca_fs *c, struct bkey_s_c k)
+{
+    struct bkey_s_c_reflink_p p = bkey_s_c_to_reflink_p(k);
+
+    pr_buf(out, "idx %llu", le64_to_cpu(p.v->idx));
+}
+
+enum merge_result
+orca_reflink_p_merge(struct orca_fs *c, struct bkey_s _l, struct bkey_s _r)
+{
+    struct bkey_s_reflink_p l = bkey_s_to_reflink_p(_l);
+    struct bkey_s_reflink_p r = bkey_s_to_reflink_p(_r);
+
+    if (le64_to_cpu(l.v->idx) + l.k->size != le64_to_cpu(r.v->idx))
+        return ORCA_MERGE_NOMERGE;
+
+    if ((u64)l.k->size + r.k->size > KEY_SIZE_MAX) {
+        orca_key_resize(l.k, KEY_SIZE_MAX);
+        orca_cut_front_s(l.k->p, _r);
+
+        return ORCA_MERGE_PARTIAL;
+    }
+
+    orca_key_resize(l.k, l.k->size + r.k->size);
+
+    return ORCA_MERGE_MERGE;
+}
+
+const char *
+orca_reflink_v_invalid(const struct orca_fs *c, struct bkey_s_c k)
+{
+    struct bkey_s_c_reflink_v r = bkey_s_c_to_reflink_v(k);
+
+    if (bkey_val_bytes(r.k) < sizeof(*r.v))
+        return "incorrect value size";
+
+    return orca_bkey_ptrs_to_text(out, c, k);
+}
+
+void
+orca_reflink_v_to_text(struct printbuf *out, struct orca_fs *c, struct bkey_s_c k)
+{
+    struct bkey_s_c_reflink_v r = bkey_s_c_to_reflink_v(k);
+    pr_buf(out, "refcount: %llu ", le64_to_cpu(r.v->refcount));
+    orca_bkey_ptrs_to_text(out, c, k);
+}
+
+static int
+orca_make_extent_indirect(struct btree_trans *trans, struct btree_iter *extent_iter,
+    struct bkey_i_extent *e)
+{
+    struct orca_fs *c = trans->c;
+    struct btree_iter *reflink_iter;
+    struct bkey_s_c k;
+    struct bkey_i_reflink_v *r_v;
+    struct bkey_i_reflink_p *r_p;
+    int ret;
+
+    for_each_btree_key(trans, reflink_iter, BTREE_ID_REFLINK, POS(0, c->reflink_hint),
+        BTREE_ITER_INTENT | BTREE_ITER_SLOTS, k, ret) {
+            if (reflink_iter->pos.inode) {
+                orca_btree_iter_set_pos(reflink_iter, POS_MIN);
+                continue;
+            }
+
+            if (bkey_deleted(k.k) && e->k.size <= k.k->size)
+                break;
+    }
+
+    if (ret)
+        goto err;
+
+    /* Rewind iter to start of hole, if necessary */
+    orca_btree_iter_set_pos(reflink_iter, bkey_start_pos(k.k));
+    r_v = orca_trans_malloc(trans, sizeof(*r_v) + bkey_val_bytes(&e->k));
+    ret = PTR_ERR_OR_ZERO(r_v);
+
+    if (ret)
+        goto err;
+
+    bkey_reflink_v_init(&r_v->k_i);
+    r_v->k.p = reflink_iter->pos;
+    orca_key_resize(&r_v->k, e->k.size);
+    r_v->k.version = e->k.version;
+
+    set_bkey_val_u64s(&r_v->k, bkey_val_u64s(&r_v->k) + bkey_val_u64s(&e->k));
+    r_v->v.refcount = 0;
+    memcpy(r_v->v.start, e->v.start, bkey_val_bytes(&e->k));
+    orca_trans_update(trans, reflink_iter, &r_v->k_i, 0);
+    r_p = orca_trans_kmalloc(trans, sizeof(*r_p));
+
+    if (IS_ERR(r_p))
+        return PTR_ERR(r_p);
+
+    e->k.type = KEY_TYPE_reflink_p;
+    r_p = bkey_i_to_reflink_p(&e->k_i);
+    set_bkey_val_bytes(&r_p->k, sizeof(r_p->v));
+    r_p->v.idx = cpu_to_le64(bkey_start_offset(&r_v->k));
+    orca_trans_update(trans, extent_iter, &r_p->k_i, 0);
+
+err:
+    if (!IS_ERR(reflink_iter))
+        c->reflink_hint = reflink_iter->pos.offset;
+
+    orca_trans_iter_put(trans, reflink_iter);
+
+    return ret;
+}
+
+static struct bkey_s_c
+get_next_src(struct btree_iter *iter, struct bpos end)
+{
+    struct bkey_s_c k = orca_btree_iter_peek(iter);
+    int ret;
+
+    for_each_btree_key_continue(iter, 0, k, ret) {
+        if (bkey_cmp(iter->pos, end) >= 0)
+            return bkey_s_c_null;
+
+        if (k.k->type == KEY_TYPE_extent || k.k->type == KEY_TYPE_reflink_p)
+            break;
+    }
+
+    return k;
+}
+
+s64
+orca_remap_range(struct orca_fs *c, struct bpos dst_start, struct bpos src_start,
+    u64 remap_sectors, u64 *journal_seq, u64 new_i_size, s64 *i_sectors_delta)
+{
+    struct btree_trans *trans;
+    struct btree_iter *dst_iter, *src_iter;
+    struct bkey_s_c src_k;
+    BKEY_PADDED(k) new_dst;
+    struct bkey_on_stack new_src;
+    struct bpos dst_end = dst_start, src_end = src_start;
+    struct bpos dst_want, src_want;
+    u64 src_done, dst_done;
+    int ret = 0, ret2 = 0;
+
+    if (!c->opts.reflink)
+        return -EOPNOTSUPP;
+
+    if (!percpu_ref_tryget(&c->writes))
+        return -EROFS;
+
+    orca_check_set_feature(c, ORCA_FEATURE_reflink);
+    dst_end.offset += remap_sectors;
+    src_end.offset += remap_sectors;
+
+    bkey_on_stack_init(&new_src);
+    orca_trans_init(&trans, c, BTREE_ITER_MAX, 4096);
+
+    src_iter = orca_trans_get_iter(&trans, BTREE_ID_EXTENTS, src_start,
+        BTREE_ITER_INTENT);
+    dst_iter = orca_trans_get_iter(&trans, BTREE_ID_EXTENTS, dst_start,
+        BTREE_ITER_INTENT);
+
+    for (;;) {
+        orca_trans_begin(&trans);
+        trans.mem_top = 0;
+
+        if (fatal_signal_pending(current)) {
+            ret = -EINTR;
+            goto err;
+        }
+
+        src_k = get_next_src(src_iter, src_end);
+        ret = bkey_err(src_k);
+
+        if (ret)
+            goto btree_err;
+
+        src_done = bpos_min(src_iter->pos, src_end).offset - src_start.offset;
+        dst_want = POS(dst_start.inode, dst_start.offset + src_done);
+
+        if (bkey_cmp(dst_iter->pos, dst_want) < 0) {
+            ret = orca_fpunch_at(&trans, dst_iter, dst_want, journal_seq,
+                i_sectors_delta);
+
+            if (ret)
+                goto btree_err;
+            continue;
+        }
+
+        BUG_ON(bkey_cmp(dst_iter->pos, dst_want));
+
+        if (!bkey_cmp(dst_iter->pos, dst_end))
+            break;
+
+        if (src_k.k->type == KEY_TYPE_extent) {
+            bkey_on_stack_reassemble(&new_src, c, src_k);
+            src_k = bkey_i_to_s_c(new_src.k);
+
+            orca_cut_front(src_iter->pos, new_src.k);
+            orca_cut_back(src_end, new_src.k);
+            ret = orca_make_extent_indirect(&trans, src_iter,
+                bkey_i_to_extent(new_src.k));
+
+            if (ret)
+                goto btree_err;
+
+            BUG_ON(src_k.k->type != KEY_TYPE_reflink_p);
+        }
+
+        if (src_k.k->type == KEY_TYPE_reflink_p) {
+            struct bkey_s_c_reflink_p src_p = bkey_s_c_to_reflink_p(src_k);
+            struct bkey_i_reflink_p *dst_p = bkey_reflink_p_init(&new_dst.k);
+            u64 offset = le64_to_cpu(src_p.v->idx) + (src_iter->pos.offset -
+                bkey_start_offset(src_k.k));
+
+            dst_p->v.idx = cpu_to_le64(offset);
+        } else {
+            BUG();
+        }
+
+        new_dst.k.k.p = dst_iter->pos;
+        orca_key_resize(&new_dst.k.k, min(src_k.k->p.offset - src_iter->pos.offset,
+            dst_end.offset - dst_iter->pos.offset));
+        ret = orca_extent_update(&trans, dst_iter, &new_dst.k, NULL, journal_seq,
+            new_i_size, i_sectors_delta);
+
+        if (ret)
+            goto btree_err;
+
+        dst_done = dst_iter->pos.offset - dst_start.offset;
+        src_want = POS(src_start.inode, src_start.offset + dst_done);
+        orca_btree_iter_set_pos(src_iter, src_want);
+
+btree_err:
+        if (ret == -EINTR)
+            ret = 0;
+
+        if (ret)
+            goto err;
+    }
+
+    BUG_ON(bkey_cmp(dst_iter->pos, dst_end));
+
+err:
+    BUG_ON(bkey_cmp(dst_iter->pos, dst_end) > 0);
+    dst_done = dst_iter->pos.offset - dst_start.offset;
+    new_i_size = min(dst_iter->pos.offset << 9, new_i_size);
+    orca_trans_begin(&trans);
+
+    do {
+        struct orca_inode_unpacked inode_u;
+        struct btree_iter *inode_iter;
+
+        inode_iter = orca_inode_peek(&trans, &inode_u, dst_start.inode,
+            BTREE_ITER_INTENT);
+        ret2 = PTR_ERR_OR_ZERO(inode_iter);
+
+        if (!ret2 && inode_u.bi_size < new_i_size) {
+            inode_u.bi_size = new_i_size;
+            ret2 = orca_inode_write(&trans, inode_iter, &inode_u) ?:
+                orca_trans_commit(&trans, NULL, journal_seq, 0);
+        }
+    } while (ret2 == -EINTR);
+
+    ret = orca_trans_exit(&trans) ?: ret;
+    bkey_on_stack_exit(&new_src, c);
+    percpu_ref_put(&c->writes);
+
+    return dst_done ?: ret ?: ret2;
+}

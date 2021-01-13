@@ -54,8 +54,8 @@ int btree_height(btree_node * const root);
 int btree_path_to_root(btree_node * const root, node * child);
 void btree_print_leaves(btree_node * const root);
 void btree_print_tree(btree_node * const root);
-void btree_find_and_print(btree_node * const root, int key, bool verbose);
-void btree_find_and_print_range(btree_node * const root, int range1, int range2, bool verbose);
+void btree_find_and_print(btree_node * const root, int key);
+void btree_find_and_print_range(btree_node * const root, int range1, int range2);
 int btree_find_range(btree_node * const root, int key_start, int key_end, bool verbose,
 	int returned_keys[], void *returned_pointers[]);
 btree_node *btree_find_leaf(btree_node * const root, int key, bool verbose);
@@ -1212,6 +1212,70 @@ main(int argc, char **argv[])
         case 'd':
             scanf("%d", &input_key);
             root = btree_delete(root, input_key);
+            btree_print_tree(root);
+            break;
+
+        case 'i':
+            fgets(buffer, BUFFER_SIZE, stdin);
+            line_consumed = true;
+            count = sscanf(buffer, "%d %d", &input_key, input_key_2);
+
+            if (count == 1) {
+                root = btree_insert(root, input_key, input_key_2);
+                btree_print_tree(root);
+                break;
+            }
+
+        case 'f':
+        case 'p':
+            scanf("%d", &input_key);
+            btree_find_and_print(root, input_key);
+            break;
+
+        case 'r':
+            scanf("%d", &input_key);
+
+            if (input_key > input_key_2) {
+                int tmp = input_key_2;
+                input_key_2 = input_key;
+                input_key = tmp;
+            }
+
+            btree_find_and_print_range(root, input_key, input_key_2);
+            break;
+
+        case 'l':
+            btree_print_leaves(root);
+            break;
+
+        case 'q':
+            while (getchar() != (int)'\n');
+            return EXIT_SUCCESS;
+            break;
+
+        case 't':
+            btree_print_tree(root);
+            break;
+
+        case 'x':
+            if (root)
+                root = btree_destroy_tree(root);
+
+            btree_print_tree(root);
+            break;
+
+        default:
+            btree_usage_2();
+            break;
         }
     }
+
+    if (!line_consumed) {
+        while (getchar() != (int)'\n');
+        printf("% ");
+    }
+
+    printf("\n");
+
+    return EXIT_SUCCESS;
 }
